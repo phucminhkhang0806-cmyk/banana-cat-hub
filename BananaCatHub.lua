@@ -1,6 +1,39 @@
--- Banana Cat Hub: client-side UI demo.
--- Run as a LocalScript in StarterPlayer > StarterPlayerScripts in Roblox Studio.
--- Game automation controls are UI placeholders; no game automation is implemented.
+-- Banana Cat Hub + Discord Webhook (2026-09-18)
+-- CACH DUNG:
+-- 1. Thay noi dung BananaCatHub.lua tren repo cua ban bang file nay.
+-- 2. Chay loader cu, mo Tab Webhook, nhap URL Discord, bam Gui ngay / bat tu dong.
+-- 3. URL chi giu trong phien dang chay. Khong dan URL webhook vao repo cong khai.
+-- Moi truong can co request/http_request (hoac BananaCatWebhookConfig.Request).
+-- LocalScript Roblox Studio thong thuong chi hien UI; khong gui HTTP tu client.
+-- Cac nut Auto ngoai tab Webhook van la giao dien mau cua file goc.
+--
+-- GIOI HAN DU LIEU:
+-- - Tuoi server KHONG suy ra tu DistributedGameTime, os.clock hay gio trong game.
+-- - Nhap tuoi server da biet, hoac cung cap SnapshotProvider; neu thieu: Chua xac dinh.
+-- - Moc ruong 4 gio chi la UOC TINH. Khong lay modulo tuoi server; khong tu suy ra
+--   lan nhat truoc, va khong reset bo dem khi nhan item tu boss/nguon khac.
+-- - CakePrinceSpawner (khong tham so bo sung) va CheckTempleDoor la query duoc
+--   thay trong script cong khai, khong phai API chinh thuc. Can thu trong game.
+-- - Pull Lever chi cho tai khoan dang chay. Khong suy ra tu trang thai can gat cua map.
+-- - Khong tu goi thao tac spawn, gat can, di chuyen, farm hoac server hop.
+--
+-- TICH HOP TUY CHON (dat truoc loader, trong getgenv().BananaCatWebhookConfig):
+-- { WebhookURL = "", Request = function(requestOptions) ... end,
+--   SnapshotProvider = function()
+--     return {serverStartedAt = UNIX_SECONDS, godChaliceNextAt = UNIX_SECONDS,
+--       fistOfDarknessNextAt = UNIX_SECONDS, cakeRemaining = 0..500,
+--       leverPulled = true_or_false}
+--   end }
+-- SnapshotProvider phai doc du lieu that da kiem chung; co the bo qua cac truong
+-- chua biet. Ham duoc goi moi 30 giay, du lieu het han sau 75 giay.
+-- Dong menu/chay lai file se dung cac tac vu webhook cu.
+--
+-- Nguon tham khao (chi doc, khong tai/chay them code):
+-- https://create.roblox.com/docs/reference/engine/classes/Workspace/DistributedGameTime
+-- https://docs.discord.com/developers/resources/webhook
+-- https://github.com/KzScripts/BloxFruits/blob/main/BloxFruits.lua
+-- https://github.com/GlobeReverse/Xenon-Hub/blob/main/Xenon.lua
+
 
 local Players = game:GetService("Players")
 local Input = game:GetService("UserInputService")
@@ -29,6 +62,7 @@ local C = {
     edge = Color3.fromRGB(66, 65, 60),
 }
 local connections, tabs, allToggles, allDropdowns = {}, {}, {}, {}
+local webhookTasks = {}
 local activeTab, dead, fpsEnabled = nil, false, false
 local settings = {transparency = 12}
 local applyFilter = function() end
@@ -109,6 +143,8 @@ local function cleanup()
     dead = true
     for _, connection in ipairs(connections) do connection:Disconnect() end
     connections = {}
+    for _, thread in pairs(webhookTasks) do pcall(task.cancel, thread) end
+    webhookTasks = {}
 end
 
 connect(gui.Destroying, cleanup)
@@ -179,7 +215,7 @@ local pageHost = new("Frame", {
 }, main)
 local noResults = text(main, "Không tìm thấy mục phù hợp.", UDim2.new(1, -24, 0, 64), UDim2.fromOffset(12, 46), 12, C.muted)
 noResults.TextXAlignment, noResults.Visible = Enum.TextXAlignment.Center, false
-local status = text(window, "CUSTOM UI • Chưa tích hợp chức năng tự động", UDim2.new(1, 0, 0, 18), UDim2.new(0, 0, 1, -18), 10, C.gold)
+local status = text(window, "Webhook theo dõi • Các nút Auto khác đang là giao diện mẫu", UDim2.new(1, 0, 0, 18), UDim2.new(0, 0, 1, -18), 10, C.gold)
 status.TextXAlignment = Enum.TextXAlignment.Center
 status.TextTruncate, status.TextWrapped = Enum.TextTruncate.AtEnd, false
 
@@ -279,7 +315,9 @@ local function toggle(tab, title, callback)
     end
     connect(obj.Activated, function() set(not value, false) end)
     set(false, true)
-    table.insert(allToggles, {Set = set})
+    local control = {Set = set}
+    table.insert(allToggles, control)
+    return control
 end
 
 local function dropdown(tab, title, values, callback)
@@ -343,9 +381,438 @@ for _, name in ipairs({"Auto Race V2", "Auto Race V3", "Auto Trial"}) do toggle(
 for _, name in ipairs({"Auto Volcano Event", "Auto Collect"}) do toggle(volcano, name) end
 for _, name in ipairs({"ESP Players", "ESP Fruits", "ESP Chests"}) do toggle(esp, name) end
 for _, name in ipairs({"Show Target", "Show Player Distance"}) do toggle(pvp, name) end
-action(webhook, "Webhook chưa được cấu hình", function()
-    status.Text = "Chưa có kết nối webhook • Không gửi dữ liệu"
-end)
+-- WEBHOOK_EXTENSION_BEGIN
+do
+    local Http = game:GetService("HttpService")
+    local Replicated = game:GetService("ReplicatedStorage")
+    local World = game:GetService("Workspace")
+    local Lighting = game:GetService("Lighting")
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local config = type(env.BananaCatWebhookConfig) == "table" and env.BananaCatWebhookConfig or {}
+    local SEA = ({[2753915549] = 1, [4442272183] = 2, [7449423635] = 3})[game.PlaceId]
+    local UNKNOWN = "Chưa xác định"
+    local POLL, STALE, MIN_SEND = 30, 75, 60
+    local CHEST_PERIOD = 4 * 60 * 60 -- Reference estimate; never a confirmed spawn time.
+    local started = os.clock()
+    local enabled, busy = false, false
+    local interval = 300
+    local nextSend, retryAt, lastSent = 0, 0, -math.huge
+    local lastKey, failures = nil, 0
+    local sending = {}
+    local manualStart, lastGodChest, lastFistChest
+    local providerState, cakeState, leverState = {}, {}, {}
+
+    -- WEBHOOK_CORE_BEGIN: pure functions, also exercised by the offline checks.
+    local function finite(value)
+        return type(value) == "number" and value == value
+            and value > -math.huge and value < math.huge
+    end
+
+    local function duration(value)
+        if not finite(value) then return UNKNOWN end
+        value = math.max(0, math.floor(value))
+        return string.format("%02d:%02d:%02d", math.floor(value / 3600), math.floor(value / 60) % 60, value % 60)
+    end
+
+    local function validCount(value)
+        return finite(value) and value >= 0 and value <= 500 and value % 1 == 0
+    end
+
+    local function parseCake(value)
+        if validCount(value) then return value end
+        if type(value) ~= "string" then return nil end
+        local message = string.lower((value:gsub("<[^>]*>", "")))
+        local count = tonumber(message:match("(%d+)%s+more%s+enem")
+            or message:match("(%d+)%s+enem[^%d]-left")
+            or message:match("còn%s+(%d+)%s+quái"))
+        if validCount(count) then return count end
+        -- Some versions return: "... defeat more enemies. N ...".
+        if message:find("enem", 1, true)
+            and (message:find("defeat", 1, true) or message:find("kill", 1, true)) then
+            local first, second
+            for number in message:gmatch("%d+") do
+                if first then second = true; break end
+                first = tonumber(number)
+            end
+            if not second and validCount(first) then return first end
+        end
+        if message:find("do you want", 1, true) and message:find("open the portal", 1, true) then
+            return 0 -- Count requirement met; this does not confirm Dough King prerequisites.
+        end
+        return nil -- An error, an empty reply or unknown text must never become zero.
+    end
+
+    local function webhookURL(value)
+        value = type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
+        local host, path = value:match("^https://([^/]+)(/[^?#]+)")
+        local allowed = host == "discord.com" or host == "discordapp.com"
+            or host == "canary.discord.com" or host == "ptb.discord.com"
+        if not allowed or not path or value:find("#", 1, true) then return nil end
+        local id, token = path:match("^/api/webhooks/(%d+)/([%w_%-]+)$")
+        if not id then id, token = path:match("^/api/v%d+/webhooks/(%d+)/([%w_%-]+)$") end
+        if not id or not token then return nil end
+        local query = value:match("%?(.*)$")
+        local thread
+        if query then
+            for part in query:gmatch("[^&]+") do
+                if part:match("^thread_id=%d+$") then
+                    thread = part
+                elseif part ~= "wait=true" and part ~= "wait=false" then
+                    return nil
+                end
+            end
+        end
+        return "https://" .. host .. path .. "?wait=true" .. (thread and "&" .. thread or "")
+    end
+
+    local function chestText(now, serverStart, lastCollected, nextAt, manual)
+        if finite(nextAt) and nextAt > 0 then
+            if nextAt > now then return "Theo nguồn tích hợp: còn " .. duration(nextAt - now) end
+            return "Đã đến mốc từ nguồn tích hợp; chưa xác nhận vật phẩm xuất hiện."
+        end
+        local base, note = lastCollected, "lần lấy từ rương bạn ghi nhận"
+        if not finite(base) then
+            base, note = serverStart, manual and "tuổi server bạn nhập" or "mốc mở server từ nguồn tích hợp"
+        end
+        if not finite(base) or base > now then return UNKNOWN .. " • thiếu mốc server/lần lấy từ rương" end
+        local remaining = base + CHEST_PERIOD - now
+        if remaining <= 0 then
+            return "Đã qua mốc tham khảo 4 giờ; không biết vật phẩm đã bị lấy hay chưa."
+        end
+        return "Ước tính còn " .. duration(remaining) .. " • từ " .. note .. "; không bảo đảm spawn"
+    end
+
+    local function retryDelay(response, decoded)
+        local delay = type(decoded) == "table" and tonumber(decoded.retry_after) or nil
+        for key, value in pairs(type(response.Headers) == "table" and response.Headers or {}) do
+            if string.lower(tostring(key)) == "retry-after" then
+                local header = tonumber(value)
+                if finite(header) and (not finite(delay) or header > delay) then delay = header end
+            end
+        end
+        return finite(delay) and math.max(1, delay + 1) or 60
+    end
+    -- WEBHOOK_CORE_END
+
+    local function run(callback)
+        if dead then return end
+        local key = {}
+        local thread = task.defer(function()
+            local ok = pcall(callback)
+            webhookTasks[key] = nil
+            if not ok and not dead then status.Text = "Webhook: gặp lỗi; kiểm tra lại kết nối hoặc dữ liệu game." end
+        end)
+        webhookTasks[key] = thread
+        return thread, key
+    end
+
+    local function nowUTC()
+        local ok, value = pcall(function() return World:GetServerTimeNow() end)
+        if ok and finite(value) then return value end
+        return os.time()
+    end
+
+    local function fresh(state)
+        if state.at and os.clock() - state.at <= STALE then return state.value end
+        return nil
+    end
+
+    local function probe(state, callback)
+        if state.pending or os.clock() < (state.nextAt or 0) then return end
+        local generation = {}
+        state.generation = generation
+        state.pending, state.nextAt = true, os.clock() + POLL
+        local thread, key = run(function()
+            local ok, value = pcall(callback)
+            if dead or state.generation ~= generation then return end
+            state.pending, state.value, state.at = false, ok and value or nil, os.clock()
+            -- Preserve false: it is a meaningful lever status.
+            if ok then state.value = value end
+        end)
+        state.thread, state.taskKey, state.startedAt = thread, key, os.clock()
+    end
+
+    local function expireProbe(state)
+        if state.pending and os.clock() - state.startedAt > 12 then
+            state.pending, state.value, state.generation = false, nil, nil
+            state.nextAt = os.clock() + POLL
+            if state.thread then pcall(task.cancel, state.thread) end
+            if state.taskKey then webhookTasks[state.taskKey] = nil end
+        end
+    end
+
+    local function queryGame()
+        for _, state in ipairs({providerState, cakeState, leverState}) do expireProbe(state) end
+        if type(config.SnapshotProvider) == "function" then
+            probe(providerState, config.SnapshotProvider)
+        end
+        if SEA ~= 3 then return end
+        local remotes = Replicated:FindFirstChild("Remotes")
+        local comm = remotes and remotes:FindFirstChild("CommF_")
+        if not comm or not comm:IsA("RemoteFunction") then return end
+        -- Community-observed query signatures; not an official Blox Fruits API.
+        -- Do not pass a boolean to CakePrinceSpawner (used for spawning controls).
+        probe(cakeState, function() return comm:InvokeServer("CakePrinceSpawner") end)
+        probe(leverState, function() return comm:InvokeServer("CheckTempleDoor") end)
+    end
+
+    local function held(item)
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        local character = player.Character
+        if (backpack and backpack:FindFirstChild(item)) or (character and character:FindFirstChild(item)) then
+            return true
+        end
+        if backpack and character then return false end
+        return nil
+    end
+
+    local function livingBoss()
+        local enemies = World:FindFirstChild("Enemies")
+        if not enemies then return nil end
+        for _, enemy in ipairs(enemies:GetChildren()) do
+            if enemy.Name:find("Cake Prince", 1, true) or enemy.Name:find("Dough King", 1, true) then
+                local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then return enemy.Name end
+            end
+        end
+        return nil -- Missing/streamed-out enemies are not proof the boss is absent.
+    end
+
+    local function snapshot()
+        local now = nowUTC()
+        local extra = fresh(providerState)
+        extra = type(extra) == "table" and extra or {}
+        local serverStart, manual = extra.serverStartedAt, false
+        if not finite(serverStart) or serverStart <= 0 or serverStart > now then
+            serverStart, manual = manualStart, manualStart ~= nil
+        end
+        local age = finite(serverStart) and (now - serverStart) or nil
+        local cake = validCount(extra.cakeRemaining) and extra.cakeRemaining or parseCake(fresh(cakeState))
+        local lever = extra.leverPulled
+        if type(lever) ~= "boolean" then lever = fresh(leverState) end
+        if type(lever) ~= "boolean" then lever = nil end
+        local god, fist, sweet = held("God's Chalice"), held("Fist of Darkness"), held("Sweet Chalice")
+        local boss = livingBoss()
+        local cakeText = UNKNOWN .. " • phản hồi game chưa có hoặc không nhận diện được"
+        if SEA ~= 3 then
+            cakeText = "Chỉ kiểm tra ở Third Sea"
+        elseif boss then
+            cakeText = "Đang thấy boss: " .. boss
+        elseif cake == 0 then
+            cakeText = "Còn 0 quái • đã đủ số lượng; chưa xác nhận các điều kiện khác"
+        elseif cake then
+            cakeText = "Còn " .. cake .. " quái để đạt mốc 500"
+        end
+        local leverText = UNKNOWN
+        if SEA ~= 3 and type(extra.leverPulled) ~= "boolean" then
+            leverText = "Vào Third Sea để kiểm tra"
+        elseif lever ~= nil then
+            leverText = lever and "Đã gạt cần (Pull Lever: YES)" or "Chưa gạt cần (Pull Lever: NO)"
+        end
+        local function possession(value)
+            if value == nil then return UNKNOWN end
+            return value and "Có trong túi/đang cầm" or "Không thấy trong túi/nhân vật"
+        end
+        return {
+            now = now,
+            serverAge = age and (duration(age) .. (manual and " • bạn nhập" or " • nguồn tích hợp")) or UNKNOWN,
+            monitoring = duration(os.clock() - started),
+            gameTime = string.format("%02d:%02d", math.floor(Lighting.ClockTime), math.floor(Lighting.ClockTime * 60) % 60),
+            cake = cakeText, lever = leverText,
+            god = SEA == 3 and chestText(now, serverStart, lastGodChest, extra.godChaliceNextAt, manual) or "Vật phẩm Third Sea",
+            fist = SEA == 2 and chestText(now, serverStart, lastFistChest, extra.fistOfDarknessNextAt, manual) or "Vật phẩm Second Sea",
+            inventory = "God's Chalice: " .. possession(god) .. "\nFist of Darkness: " .. possession(fist)
+                .. "\nSweet Chalice: " .. possession(sweet),
+            key = table.concat({tostring(cake and math.ceil(cake / 25)), tostring(lever), tostring(god), tostring(fist), tostring(sweet), boss or ""}, "|"),
+        }
+    end
+
+    local function labelRow(title, height)
+        local box = row(webhook, title, height or 58)
+        box.AutoButtonColor = false
+        text(box, title, UDim2.new(1, -20, 0, 20), UDim2.fromOffset(10, 3), 11, C.gold)
+        return text(box, "", UDim2.new(1, -20, 1, -26), UDim2.fromOffset(10, 24), 11, C.text)
+    end
+
+    local note = labelRow("Webhook Discord", 86)
+    note.Text = "Nhập URL, bấm Gửi ngay hoặc bật gửi tự động. Tuổi server có thể chưa xác định. Mốc rương 4 giờ chỉ là tham khảo."
+    local urlRow = row(webhook, "Discord Webhook URL", 64)
+    text(urlRow, "Discord Webhook URL • chỉ giữ trong phiên này", UDim2.new(1, -20, 0, 20), UDim2.fromOffset(10, 3), 11, C.gold)
+    local urlBox = searchBox(urlRow, "https://discord.com/api/webhooks/...", UDim2.new(1, -16, 0, 29), UDim2.fromOffset(8, 27))
+    local currentURL = type(config.WebhookURL) == "string" and config.WebhookURL or ""
+    urlBox.Text = currentURL == "" and "" or "•••••••• (đã nhập URL)"
+    connect(urlBox.Focused, function() urlBox.Text = currentURL end)
+    connect(urlBox.FocusLost, function()
+        currentURL = urlBox.Text:match("^%s*(.-)%s*$")
+        urlBox.Text = currentURL == "" and "" or "•••••••• (đã nhập URL)"
+        failures = 0
+    end)
+
+    local ageRow = row(webhook, "Tuổi server đã biết (phút)", 64)
+    text(ageRow, "Tuổi server đã biết (phút) • tùy chọn", UDim2.new(1, -20, 0, 20), UDim2.fromOffset(10, 3), 11, C.gold)
+    local ageBox = searchBox(ageRow, "Để trống nếu bạn không biết", UDim2.new(1, -16, 0, 29), UDim2.fromOffset(8, 27))
+    connect(ageBox.FocusLost, function()
+        local value = ageBox.Text:match("^%s*(.-)%s*$")
+        if value == "" then manualStart = nil; return end
+        local minutes = tonumber(value)
+        if finite(minutes) and minutes >= 0 and minutes <= 525600 then
+            manualStart = nowUTC() - minutes * 60
+            status.Text = "Đã đặt tuổi server theo số bạn nhập."
+        else
+            manualStart, ageBox.Text = nil, ""
+            status.Text = "Tuổi server phải là số phút từ 0 đến 525600."
+        end
+    end)
+
+    dropdown(webhook, "Chu kỳ gửi (mặc định 300 giây):", {60, 120, 300, 600}, function(value)
+        interval, nextSend = value, os.clock() + value
+    end)
+    local autoToggle = toggle(webhook, "Tự động gửi webhook", function(value)
+        enabled = value
+        if value then nextSend, lastKey = os.clock() + 2, snapshot().key end
+        if value then status.Text = "Webhook: đã bật gửi định kỳ và khi trạng thái thay đổi." end
+    end)
+
+    local feedback = labelRow("Kết nối webhook", 66)
+    feedback.Text = "Chưa gửi. Cần môi trường có hàm request hoặc http_request."
+    local timeLabel = labelRow("Server time / Tuổi server", 82)
+    local godLabel = labelRow("God's Chalice • thời gian rương", 92)
+    local fistLabel = labelRow("Fist of Darkness • thời gian rương", 92)
+    local cakeLabel = labelRow("Katakuri / Cake Prince / Dough King", 76)
+    local leverLabel = labelRow("Pull Lever • tài khoản đang chạy", 64)
+    local itemLabel = labelRow("Vật phẩm đang giữ", 100)
+
+    local function render(s)
+        timeLabel.Text = "Tuổi server: " .. s.serverAge .. "\nTheo dõi từ lúc bật script: " .. s.monitoring .. "\nGiờ trong game: " .. s.gameTime
+        godLabel.Text, fistLabel.Text = s.god, s.fist
+        cakeLabel.Text, leverLabel.Text, itemLabel.Text = s.cake, s.lever, s.inventory
+    end
+
+    local function getRequest()
+        if type(config.Request) == "function" then return config.Request end
+        if type(request) == "function" then return request end
+        if type(http_request) == "function" then return http_request end
+        if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+        if type(http) == "table" and type(http.request) == "function" then return http.request end
+        return nil -- HttpService cannot send HTTP requests from a normal LocalScript.
+    end
+
+    local function payload(s)
+        local function field(name, value, inline) return {name = name, value = tostring(value), inline = inline or false} end
+        return {
+            username = "Banana Cat Hub",
+            allowed_mentions = {parse = {}},
+            embeds = {{
+                title = "Blox Fruits • Thông báo server",
+                color = 16113031,
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(s.now)),
+                fields = {
+                    field("Người chơi", player.Name .. " (" .. tostring(player.UserId) .. ")", true),
+                    field("Sea / số người", (SEA and "Sea " .. SEA or "Không nhận diện") .. " • " .. #Players:GetPlayers(), true),
+                    field("Server JobId", game.JobId ~= "" and game.JobId or "Studio / chưa có JobId"),
+                    field("PlaceId", game.PlaceId, true),
+                    field("Tuổi server", s.serverAge, true),
+                    field("Theo dõi từ khi bật script", s.monitoring, true),
+                    field("Giờ trong game", s.gameTime, true),
+                    field("God's Chalice • rương", s.god),
+                    field("Fist of Darkness • rương", s.fist),
+                    field("Katakuri / số quái còn lại", s.cake),
+                    field("Pull Lever • người chơi này", s.lever),
+                    field("Vật phẩm đang giữ", s.inventory),
+                },
+                footer = {text = "Mốc 4 giờ là ước tính; không xác nhận spawn hay lần người khác nhặt. Số quái/lever được đọc khoảng mỗi 30 giây."},
+            }},
+        }
+    end
+
+    local function send(s)
+        if dead or busy then return end
+        local clock = os.clock()
+        local waitFor = math.max(retryAt - clock, MIN_SEND - (clock - lastSent))
+        if waitFor > 0 then feedback.Text = "Chờ " .. math.ceil(waitFor) .. " giây trước lần gửi tiếp theo."; return end
+        local url = webhookURL(currentURL)
+        local transport = getRequest()
+        if not url or not transport then
+            feedback.Text = not url and "URL Discord webhook chưa hợp lệ."
+                or "Môi trường này không có request/http_request để gửi webhook."
+            autoToggle.Set(false, true)
+            return
+        end
+        busy, lastSent = true, clock
+        local generation = {}
+        sending.generation, sending.startedAt = generation, clock
+        feedback.Text = "Đang gửi..."
+        local thread, taskKey = run(function()
+            local bodyOK, body = pcall(function() return Http:JSONEncode(payload(s)) end)
+            if not bodyOK then busy = false; feedback.Text = "Không tạo được nội dung webhook."; return end
+            local ok, response = pcall(transport, {
+                Url = url, Method = "POST", Headers = {["Content-Type"] = "application/json"},
+                Body = body, Timeout = 15,
+            })
+            if dead or sending.generation ~= generation then return end
+            busy = false
+            local code = ok and type(response) == "table" and tonumber(response.StatusCode or response.Status) or nil
+            if code and code >= 200 and code < 300 then
+                failures, lastKey, nextSend = 0, s.key, os.clock() + interval
+                feedback.Text = "Đã gửi lúc " .. os.date("!%H:%M:%S") .. " UTC."
+            elseif code == 429 then
+                local decodedOK, decoded = pcall(function() return Http:JSONDecode(response.Body or "") end)
+                retryAt = os.clock() + retryDelay(response, decodedOK and decoded or nil)
+                feedback.Text = "Discord giới hạn tần suất. Tự chờ " .. math.ceil(retryAt - os.clock()) .. " giây."
+            elseif code and code >= 400 and code < 500 then
+                autoToggle.Set(false, true)
+                feedback.Text = "Discord trả HTTP " .. code .. ". Đã tắt tự gửi; kiểm tra URL và quyền webhook."
+            else
+                failures = failures + 1
+                retryAt = os.clock() + math.min(600, 60 * 2 ^ math.min(failures - 1, 4))
+                feedback.Text = "Gửi thất bại" .. (code and " (HTTP " .. code .. ")" or " do kết nối") .. ". Sẽ thử lại nếu tự gửi đang bật."
+            end
+        end)
+        sending.thread, sending.taskKey = thread, taskKey
+    end
+
+    action(webhook, "Gửi ngay trạng thái đang hiển thị", function() send(snapshot()) end)
+    action(webhook, "Làm mới trạng thái game", function()
+        queryGame()
+        render(snapshot())
+        status.Text = "Đang làm mới • truy vấn game tối đa một lần mỗi 30 giây."
+    end)
+    action(webhook, "Ghi nhận VỪA LẤY God's Chalice TỪ RƯƠNG", function()
+        if SEA ~= 3 then status.Text = "God's Chalice: cần Third Sea."; return end
+        lastGodChest = nowUTC()
+        status.Text = "Đã ghi mốc do bạn xác nhận. Mốc tiếp theo chỉ là ước tính."
+    end)
+    action(webhook, "Ghi nhận VỪA LẤY Fist of Darkness TỪ RƯƠNG", function()
+        if SEA ~= 2 then status.Text = "Fist of Darkness: cần Second Sea."; return end
+        lastFistChest = nowUTC()
+        status.Text = "Đã ghi mốc do bạn xác nhận. Mốc tiếp theo chỉ là ước tính."
+    end)
+    action(webhook, "Xóa các mốc thời gian đã nhập", function()
+        manualStart, lastGodChest, lastFistChest = nil, nil, nil
+        ageBox.Text = ""
+        render(snapshot())
+    end)
+
+    render(snapshot())
+    run(function()
+        while not dead do
+            queryGame()
+            local s = snapshot()
+            render(s)
+            if busy and os.clock() - sending.startedAt > 20 then
+                busy, sending.generation = false, nil
+                if sending.thread then pcall(task.cancel, sending.thread) end
+                if sending.taskKey then webhookTasks[sending.taskKey] = nil end
+                retryAt = os.clock() + 60
+                feedback.Text = "Hết thời gian chờ phản hồi webhook; chưa xác nhận gửi thành công."
+            end
+            if enabled and not busy and os.clock() >= retryAt and os.clock() - lastSent >= MIN_SEND
+                and (os.clock() >= nextSend or s.key ~= lastKey) then send(s) end
+            task.wait(1)
+        end
+    end)
+end
+-- WEBHOOK_EXTENSION_END
 
 toggle(setting, "Show FPS", function(enabled)
     fpsEnabled, hud.Visible = enabled, enabled
